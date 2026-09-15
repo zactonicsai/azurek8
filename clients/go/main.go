@@ -1,6 +1,7 @@
 // artifactd-cli: upload, download and list artifacts on an artifactd server.
 // Standard library only.
 //
+//	artifactd-cli [-url URL] mkrepo   <repo>
 //	artifactd-cli [-url URL] upload   <repo> <path> <file> [-no-checksum]
 //	artifactd-cli [-url URL] download <repo> <path> [outfile]
 //	artifactd-cli [-url URL] list     <repo> [prefix] [-r]
@@ -64,8 +65,22 @@ type DirEntry struct {
 	Size  int64  `json:"size,omitempty"`
 }
 
+// cleanPath normalizes a user-supplied artifact path: backslashes become
+// slashes, leading/trailing/duplicate slashes are dropped. Empty segments
+// would otherwise make the server answer with a 301/307 redirect.
+func cleanPath(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	var segs []string
+	for _, s := range strings.Split(p, "/") {
+		if s != "" && s != "." {
+			segs = append(segs, s)
+		}
+	}
+	return strings.Join(segs, "/")
+}
+
 func (c *Client) artifactURL(repo, p string) string {
-	segs := strings.Split(p, "/")
+	segs := strings.Split(cleanPath(p), "/")
 	for i, s := range segs {
 		segs[i] = url.PathEscape(s)
 	}
@@ -92,7 +107,30 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	if msg == "" {
 		msg = resp.Status
 	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		msg = fmt.Sprintf("unexpected redirect to %q (check that the base URL points directly at artifactd and the artifact path has no empty segments)", resp.Header.Get("Location"))
+	}
 	return nil, &Error{Status: resp.StatusCode, Message: msg}
+}
+
+// CreateRepo creates a repository. Returns true if it was created, false if it already existed.
+func (c *Client) CreateRepo(repo string) (bool, error) {
+	req, err := http.NewRequest(http.MethodPut, c.BaseURL+"/api/repos/"+url.PathEscape(repo), nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Created bool `json:"created"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, err
+	}
+	return out.Created, nil
 }
 
 // Upload sends a local file. If verifyChecksum is set, the file is hashed
@@ -197,7 +235,7 @@ func (c *Client) ListRecursive(repo, prefix string) ([]ArtifactInfo, error) {
 }
 
 func (c *Client) listURL(repo, prefix string, recursive bool) string {
-	p := strings.Trim(prefix, "/")
+	p := cleanPath(prefix)
 	u := c.artifactURL(repo, p)
 	if p != "" {
 		u += "/"
@@ -225,6 +263,7 @@ func (c *Client) getJSON(u string, v any) error {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
+  artifactd-cli [-url URL] mkrepo   <repo>
   artifactd-cli [-url URL] upload   <repo> <path> <file> [-no-checksum]
   artifactd-cli [-url URL] download <repo> <path> [outfile]
   artifactd-cli [-url URL] list     <repo> [prefix] [-r]`)
@@ -243,6 +282,19 @@ func main() {
 
 	var err error
 	switch args[0] {
+	case "mkrepo":
+		if len(args) != 2 {
+			usage()
+		}
+		var created bool
+		created, err = c.CreateRepo(args[1])
+		if err == nil {
+			if created {
+				fmt.Printf("repo %s created\n", args[1])
+			} else {
+				fmt.Printf("repo %s already exists\n", args[1])
+			}
+		}
 	case "upload":
 		fs := flag.NewFlagSet("upload", flag.ExitOnError)
 		noSum := fs.Bool("no-checksum", false, "skip client-side SHA-256 verification header")

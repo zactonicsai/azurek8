@@ -23,6 +23,7 @@ import java.util.regex.Pattern;
  * artifactd client: upload, download and list. Java 11+, no dependencies.
  *
  * <pre>
+ *   java ArtifactdClient.java [--url URL] mkrepo   &lt;repo&gt;
  *   java ArtifactdClient.java [--url URL] upload   &lt;repo&gt; &lt;path&gt; &lt;file&gt; [--no-checksum]
  *   java ArtifactdClient.java [--url URL] download &lt;repo&gt; &lt;path&gt; [outfile]
  *   java ArtifactdClient.java [--url URL] list     &lt;repo&gt; [prefix] [-r]
@@ -71,14 +72,28 @@ public class ArtifactdClient {
         return URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20").replace("*", "%2A");
     }
 
+    /** Drop empty and "." segments; empty segments make the server redirect instead of serving. */
+    static String cleanPath(String path) {
+        StringBuilder sb = new StringBuilder();
+        for (String s : path.replace('\\', '/').split("/")) {
+            if (s.isEmpty() || s.equals(".")) continue;
+            if (sb.length() > 0) sb.append('/');
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
     private URI artifactUri(String repo, String path, String query) {
         StringBuilder sb = new StringBuilder(baseUrl).append("/api/repos/").append(seg(repo)).append("/artifacts/");
+        boolean dir = path.endsWith("/");
+        path = cleanPath(path);
         if (!path.isEmpty()) {
             String[] parts = path.split("/", -1);
             for (int i = 0; i < parts.length; i++) {
                 if (i > 0) sb.append('/');
                 sb.append(seg(parts[i]));
             }
+            if (dir) sb.append('/');
         }
         if (query != null) sb.append('?').append(query);
         return URI.create(sb.toString());
@@ -108,6 +123,15 @@ public class ArtifactdClient {
     }
 
     // -- API ----------------------------------------------------------------
+
+    /** Create a repository. Returns true if created, false if it already existed. */
+    public boolean createRepo(String repo) throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/api/repos/" + seg(repo)))
+                .timeout(Duration.ofMinutes(1)).PUT(HttpRequest.BodyPublishers.noBody()).build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        check(resp, resp.body());
+        return resp.statusCode() == 201;
+    }
 
     /** Upload a local file. Returns the server's JSON response body. */
     public String upload(String repo, String path, Path file, boolean verifyChecksum) throws IOException, InterruptedException {
@@ -140,7 +164,7 @@ public class ArtifactdClient {
 
     /** List one directory (recursive=false) or every file under prefix (recursive=true). */
     public List<Entry> list(String repo, String prefix, boolean recursive) throws IOException, InterruptedException {
-        String p = prefix == null ? "" : prefix.replaceAll("^/+|/+$", "");
+        String p = prefix == null ? "" : cleanPath(prefix);
         URI uri = artifactUri(repo, p.isEmpty() ? "" : p + "/", recursive ? "recursive=1" : null);
         HttpRequest req = HttpRequest.newBuilder(uri).timeout(Duration.ofMinutes(1)).GET().build();
         HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
@@ -178,6 +202,7 @@ public class ArtifactdClient {
 
     private static void usage() {
         System.err.println("usage:\n"
+                + "  ArtifactdClient [--url URL] mkrepo   <repo>\n"
                 + "  ArtifactdClient [--url URL] upload   <repo> <path> <file> [--no-checksum]\n"
                 + "  ArtifactdClient [--url URL] download <repo> <path> [outfile]\n"
                 + "  ArtifactdClient [--url URL] list     <repo> [prefix] [-r]");
@@ -199,6 +224,12 @@ public class ArtifactdClient {
         ArtifactdClient c = new ArtifactdClient(url);
         try {
             switch (args.get(0)) {
+                case "mkrepo": {
+                    if (args.size() != 2) usage();
+                    boolean created = c.createRepo(args.get(1));
+                    System.out.println("repo " + args.get(1) + (created ? " created" : " already exists"));
+                    break;
+                }
                 case "upload": {
                     if (args.size() != 4) usage();
                     String body = c.upload(args.get(1), args.get(2), Paths.get(args.get(3)), !noChecksum);

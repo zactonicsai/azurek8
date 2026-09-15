@@ -9,6 +9,7 @@ Library use:
     for f in c.list("tools", recursive=True): print(f["path"], f["size"])
 
 CLI use:
+    artifactd_client.py [--url URL] mkrepo   <repo>
     artifactd_client.py [--url URL] upload   <repo> <path> <file> [--overwrite-check]
     artifactd_client.py [--url URL] download <repo> <path> [outfile]
     artifactd_client.py [--url URL] list     <repo> [prefix] [--recursive]
@@ -42,7 +43,14 @@ class ArtifactdClient:
 
     # -- helpers ------------------------------------------------------------
 
+    @staticmethod
+    def _clean(path):
+        # Drop empty/"." segments: leading, trailing or doubled slashes would make
+        # the server reply with a redirect instead of handling the request.
+        return "/".join(s for s in path.replace("\\", "/").split("/") if s and s != ".")
+
     def _url(self, repo, path=""):
+        path = self._clean(path)
         # quote each segment but keep "/" separators
         quoted = "/".join(urllib.parse.quote(seg, safe="") for seg in path.split("/")) if path else ""
         return f"{self.base_url}/api/repos/{urllib.parse.quote(repo, safe='')}/artifacts/{quoted}"
@@ -59,6 +67,13 @@ class ArtifactdClient:
             raise ArtifactdError(e.code, msg) from None
 
     # -- API ----------------------------------------------------------------
+
+    def create_repo(self, repo):
+        """Create a repository. Returns True if created, False if it already existed."""
+        url = f"{self.base_url}/api/repos/{urllib.parse.quote(repo, safe='')}"
+        req = urllib.request.Request(url, method="PUT")
+        with self._request(req) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("created", resp.status == 201)
 
     def upload(self, repo, path, filename, verify_checksum=True):
         """Upload a local file. Returns the server's JSON (path, size, sha256)."""
@@ -87,8 +102,10 @@ class ArtifactdClient:
 
     def list(self, repo, prefix="", recursive=False):
         """List a directory (entries) or, with recursive=True, all files under prefix."""
-        p = prefix.strip("/")
-        url = self._url(repo, p + "/" if p else "")
+        p = self._clean(prefix)
+        url = self._url(repo, p)
+        if p:
+            url += "/"
         if recursive:
             url += "?recursive=1"
         req = urllib.request.Request(url, method="GET")
@@ -104,6 +121,9 @@ def main(argv=None):
     ap.add_argument("--url", help="server base URL (default $ARTIFACTD_URL or http://localhost:8080)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    mk = sub.add_parser("mkrepo")
+    mk.add_argument("repo")
+
     up = sub.add_parser("upload")
     up.add_argument("repo"); up.add_argument("path"); up.add_argument("file")
     up.add_argument("--no-checksum", action="store_true", help="skip client-side SHA-256 verification header")
@@ -118,7 +138,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     c = ArtifactdClient(args.url)
     try:
-        if args.cmd == "upload":
+        if args.cmd == "mkrepo":
+            created = c.create_repo(args.repo)
+            print(f"repo {args.repo} {'created' if created else 'already exists'}")
+        elif args.cmd == "upload":
             info = c.upload(args.repo, args.path, args.file, verify_checksum=not args.no_checksum)
             print(f"uploaded {info['path']} ({info['size']} bytes) sha256={info['sha256']}")
         elif args.cmd == "download":

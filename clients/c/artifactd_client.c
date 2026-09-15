@@ -1,6 +1,7 @@
 /*
  * artifactd client: upload, download and list. Requires libcurl.
  *
+ *   artifactd-cli [--url URL] mkrepo   <repo>
  *   artifactd-cli [--url URL] upload   <repo> <path> <file> [--no-checksum]
  *   artifactd-cli [--url URL] download <repo> <path> [outfile]
  *   artifactd-cli [--url URL] list     <repo> [prefix] [-r]
@@ -63,14 +64,23 @@ static char *artifact_url(CURL *c, const char *base, const char *repo, const cha
     while (*p) {
         const char *slash = strchr(p, '/');
         size_t seglen = slash ? (size_t)(slash - p) : strlen(p);
+        /* skip empty and "." segments: they would make the server redirect */
+        if (seglen == 0 || (seglen == 1 && *p == '.')) {
+            if (slash) { p = slash + 1; continue; } else break;
+        }
+        /* strip a trailing "/" left by a previous segment when we are the first real one */
+        if (url[strlen(url) - 1] != '/') strncat(url, "/", cap - strlen(url) - 1);
         char *seg = strndup(p, seglen);
         char *esc = seg ? curl_easy_escape(c, seg, (int)seglen) : NULL;
         free(seg);
         if (!esc) { free(url); return NULL; }
         strncat(url, esc, cap - strlen(url) - 1);
         curl_free(esc);
-        if (slash) { strncat(url, "/", cap - strlen(url) - 1); p = slash + 1; } else break;
+        if (slash) p = slash + 1; else break;
     }
+    /* a trailing slash in `path` means "list this directory": keep it */
+    if (*path && path[strlen(path) - 1] == '/' && url[strlen(url) - 1] != '/')
+        strncat(url, "/", cap - strlen(url) - 1);
     if (query) { strncat(url, "?", cap - strlen(url) - 1); strncat(url, query, cap - strlen(url) - 1); }
     return url;
 }
@@ -127,6 +137,32 @@ static int sha256_file(const char *fn, char out[65]) {
 /* ---------------------------------------------------------------------------
  * Public API. All return 0 on success, -1 on failure with `err` filled in.
  * ------------------------------------------------------------------------- */
+
+/* Create a repository. On success sets *created to 1 (new) or 0 (already existed). */
+int artifactd_create_repo(const char *base, const char *repo, int *created, char *err, size_t errlen) {
+    int rc = -1;
+    CURL *c = curl_easy_init();
+    if (!c) { snprintf(err, errlen, "curl init failed"); return -1; }
+    char *r = curl_easy_escape(c, repo, 0);
+    const char *b = base_url(base);
+    size_t cap = strlen(b) + strlen(r) + 32;
+    char *url = malloc(cap);
+    snprintf(url, cap, "%s/api/repos/%s", b, r);
+    curl_free(r);
+    struct membuf resp = {0};
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, mem_write);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    CURLcode cc = curl_easy_perform(c);
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    if (cc != CURLE_OK) snprintf(err, errlen, "%s", curl_easy_strerror(cc));
+    else if (status < 200 || status >= 300) extract_error(resp.data, status, err, errlen);
+    else { if (created) *created = (status == 201); rc = 0; }
+    free(resp.data); free(url); curl_easy_cleanup(c);
+    return rc;
+}
 
 int artifactd_upload(const char *base, const char *repo, const char *path, const char *file,
                      int verify_checksum, char *err, size_t errlen, struct membuf *response) {
@@ -212,13 +248,13 @@ int artifactd_download(const char *base, const char *repo, const char *path, con
 int artifactd_list(const char *base, const char *repo, const char *prefix, int recursive,
                    struct membuf *out, char *err, size_t errlen) {
     int rc = -1;
-    /* trim slashes, append one so the server lists the directory */
-    while (*prefix == '/') prefix++;
+    /* append a "/" so the server lists the directory (artifact_url drops empty segments) */
+    int has_real = 0;
+    for (const char *q = prefix; *q; q++) if (*q != '/') { has_real = 1; break; }
     size_t pl = strlen(prefix);
-    while (pl && prefix[pl - 1] == '/') pl--;
     char *p = malloc(pl + 2);
     memcpy(p, prefix, pl); p[pl] = 0;
-    if (pl) strcat(p, "/");
+    if (has_real) strcat(p, "/");
 
     CURL *c = curl_easy_init();
     char *url = artifact_url(c, base_url(base), repo, p, recursive ? "recursive=1" : NULL);
@@ -246,6 +282,7 @@ int artifactd_list(const char *base, const char *repo, const char *prefix, int r
 static int usage(void) {
     fprintf(stderr,
         "usage:\n"
+        "  artifactd-cli [--url URL] mkrepo   <repo>\n"
         "  artifactd-cli [--url URL] upload   <repo> <path> <file> [--no-checksum]\n"
         "  artifactd-cli [--url URL] download <repo> <path> [outfile]\n"
         "  artifactd-cli [--url URL] list     <repo> [prefix] [-r]\n");
@@ -268,7 +305,13 @@ int main(int argc, char **argv) {
     char err[ERRBUF] = {0};
     int rc = 0;
 
-    if (!strcmp(pos[0], "upload")) {
+    if (!strcmp(pos[0], "mkrepo")) {
+        if (np != 2) return usage();
+        int created = 0;
+        if (artifactd_create_repo(url, pos[1], &created, err, sizeof err) == 0)
+            printf("repo %s %s\n", pos[1], created ? "created" : "already exists");
+        else rc = 1;
+    } else if (!strcmp(pos[0], "upload")) {
         if (np != 4) return usage();
         struct membuf resp = {0};
         if (artifactd_upload(url, pos[1], pos[2], pos[3], checksum, err, sizeof err, &resp) == 0) {

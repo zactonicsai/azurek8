@@ -1,5 +1,6 @@
 // artifactd client: upload, download and list. .NET 8, no packages.
 //
+//   artifactd-cli [--url URL] mkrepo   <repo>
 //   artifactd-cli [--url URL] upload   <repo> <path> <file> [--no-checksum]
 //   artifactd-cli [--url URL] download <repo> <path> [outfile]
 //   artifactd-cli [--url URL] list     <repo> [prefix] [-r]
@@ -49,9 +50,15 @@ public sealed class ArtifactdClient : IDisposable
 
     // -- helpers ------------------------------------------------------------
 
+    /// <summary>Drop empty and "." segments; empty segments make the server redirect instead of serving.</summary>
+    private static string CleanPath(string path) =>
+        string.Join("/", path.Replace('\\', '/').Split('/').Where(s => s.Length > 0 && s != "."));
+
     private string ArtifactUrl(string repo, string path, string? query = null)
     {
-        var segs = path.Length == 0 ? "" : string.Join("/", path.Split('/').Select(Uri.EscapeDataString));
+        var dir = path.EndsWith('/');
+        path = CleanPath(path);
+        var segs = path.Length == 0 ? "" : string.Join("/", path.Split('/').Select(Uri.EscapeDataString)) + (dir ? "/" : "");
         var url = $"{BaseUrl}/api/repos/{Uri.EscapeDataString(repo)}/artifacts/{segs}";
         return query is null ? url : $"{url}?{query}";
     }
@@ -79,6 +86,15 @@ public sealed class ArtifactdClient : IDisposable
     }
 
     // -- API ----------------------------------------------------------------
+
+    /// <summary>Create a repository. Returns true if created, false if it already existed.</summary>
+    public async Task<bool> CreateRepoAsync(string repo, CancellationToken ct = default)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Put, $"{BaseUrl}/api/repos/{Uri.EscapeDataString(repo)}");
+        using var resp = await _http.SendAsync(req, ct);
+        await EnsureSuccess(resp);
+        return resp.StatusCode == HttpStatusCode.Created;
+    }
 
     public async Task<ArtifactInfo> UploadAsync(string repo, string path, string file, bool verifyChecksum = true, CancellationToken ct = default)
     {
@@ -112,7 +128,7 @@ public sealed class ArtifactdClient : IDisposable
     /// <summary>List one directory of the repo (prefix "" = root).</summary>
     public async Task<List<DirEntry>> ListAsync(string repo, string prefix = "", CancellationToken ct = default)
     {
-        var p = prefix.Trim('/');
+        var p = CleanPath(prefix);
         using var resp = await _http.GetAsync(ArtifactUrl(repo, p.Length == 0 ? "" : p + "/"), ct);
         await EnsureSuccess(resp);
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
@@ -122,7 +138,7 @@ public sealed class ArtifactdClient : IDisposable
     /// <summary>List every file under prefix.</summary>
     public async Task<List<ArtifactInfo>> ListRecursiveAsync(string repo, string prefix = "", CancellationToken ct = default)
     {
-        var p = prefix.Trim('/');
+        var p = CleanPath(prefix);
         using var resp = await _http.GetAsync(ArtifactUrl(repo, p.Length == 0 ? "" : p + "/", "recursive=1"), ct);
         await EnsureSuccess(resp);
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
@@ -138,6 +154,7 @@ public static class Program
     {
         Console.Error.WriteLine(
             "usage:\n" +
+            "  artifactd-cli [--url URL] mkrepo   <repo>\n" +
             "  artifactd-cli [--url URL] upload   <repo> <path> <file> [--no-checksum]\n" +
             "  artifactd-cli [--url URL] download <repo> <path> [outfile]\n" +
             "  artifactd-cli [--url URL] list     <repo> [prefix] [-r]");
@@ -163,6 +180,13 @@ public static class Program
         {
             switch (args[0])
             {
+                case "mkrepo":
+                {
+                    if (args.Count != 2) return Usage();
+                    var created = await c.CreateRepoAsync(args[1]);
+                    Console.WriteLine($"repo {args[1]} {(created ? "created" : "already exists")}");
+                    return 0;
+                }
                 case "upload":
                 {
                     if (args.Count != 4) return Usage();

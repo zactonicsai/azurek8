@@ -5,12 +5,13 @@ Every client has the same CLI shape and reads the server URL from `--url` or `$A
 (default `http://localhost:8080`):
 
 ```
+<cli> [--url URL] mkrepo   <repo>
 <cli> [--url URL] upload   <repo> <path> <file> [--no-checksum]
 <cli> [--url URL] download <repo> <path> [outfile]
 <cli> [--url URL] list     <repo> [prefix] [-r]
 ```
 
-`upload` computes the file's SHA-256 client-side and sends it as `X-Checksum-SHA256` so the server
+`mkrepo` creates a repository (idempotent: reports "already exists" on a second call). `upload` computes the file's SHA-256 client-side and sends it as `X-Checksum-SHA256` so the server
 rejects corrupted transfers (`--no-checksum` skips this). `download` writes to `<outfile>.part` and
 renames on success. `list` shows one directory level; `-r` lists every file under the prefix.
 
@@ -32,7 +33,7 @@ adding a JSON parser dependency.
 
 ```sh
 export ARTIFACTD_URL=http://localhost:8080
-curl -X PUT $ARTIFACTD_URL/api/repos/tools      # create repo (any client)
+python3 python/artifactd_client.py mkrepo tools
 
 python3 python/artifactd_client.py upload tools demo/hello.bin ./hello.bin
 python3 python/artifactd_client.py list tools -r
